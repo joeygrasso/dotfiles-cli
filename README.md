@@ -53,6 +53,51 @@ else `~/repos/dotfiles`. Other commands find the repo via `$DOTFILES_DIR`, `$DOT
 
 Files that would be replaced are moved to `~/.dotfiles-backup/<timestamp>/`, never overwritten.
 
+## Examples
+
+**Adopt an existing machine.** Your repo is already cloned, just not at `~/repos/dotfiles`:
+
+```sh
+export DOTFILES_DIR=~/code/dotfiles   # only needed until the first install records the path
+dotfiles install -n                   # preview links, backups and hooks; changes nothing
+dotfiles install
+dotfiles dir                          # now finds the repo without DOTFILES_DIR
+```
+
+Anything `install` replaces is moved to `~/.dotfiles-backup/<timestamp>/`. Diff the backups against
+the linked versions if you want to keep a machine-specific setting, e.g. in a local include file your
+config sources (`~/.gitconfig.local`, `~/.zshrc.local`).
+
+**New machine, full setup:**
+
+```sh
+dotfiles init you/dotfiles            # owner/name clones over SSH; --https for public repos
+dotfiles bootstrap                    # Aptfile, Brewfiles, plugins, links, mise, login shell
+dotfiles bootstrap --work acme        # same, plus work/acme.* and work/Brewfile.acme
+```
+
+**Links only, or plugins only:**
+
+```sh
+dotfiles install                      # just the manifest's link/merge lines (+ hooks)
+dotfiles plugins                      # just the manifest's clone lines
+```
+
+**Keep machines in sync:**
+
+```sh
+dotfiles update -n                    # pull, then preview the re-link
+dotfiles update                       # pull and re-link, re-applying installed work profiles
+cd "$(dotfiles dir)"                  # edit, commit, push from the checkout
+```
+
+**Try someone else's repo safely:**
+
+```sh
+dotfiles init -d /tmp/their-dots them/dotfiles   # init lists any hooks it found
+DOTFILES_DIR=/tmp/their-dots dotfiles install -n # see what would change; runs no repo code
+```
+
 ## The dotfiles repo
 
 A dotfiles repo is any directory with a `manifest` at its root:
