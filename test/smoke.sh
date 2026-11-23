@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Smoke tests for bin/dotfiles against a throwaway $HOME and a fixture dotfiles repo.
 # Usage: test/smoke.sh
+# The fake hooks and tools below are written with single quotes on purpose: their $vars must
+# expand when they run, not here.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 CLI_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/dotfiles"
@@ -36,9 +39,7 @@ echo "# zshrc" > "$REPO/zsh/zshrc"
 echo '{"a":1}' > "$REPO/claude/settings.json"
 echo "# acme" > "$REPO/work/acme.rc"
 echo "Host acme" > "$REPO/work/acme.ssh"
-# shellcheck disable=SC2016 # $HOME expands when the hook runs, not here
 printf '#!/bin/sh\ntouch "$HOME/pre-install-ran"\n' > "$REPO/hooks/pre-install"
-# shellcheck disable=SC2016
 printf '#!/bin/sh\ntouch "$HOME/acme-install-ran"\n' > "$REPO/work/acme.install"
 chmod +x "$REPO/hooks/pre-install" "$REPO/work/acme.install"
 cat > "$REPO/manifest" <<'EOF'
