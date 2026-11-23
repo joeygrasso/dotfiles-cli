@@ -1,0 +1,28 @@
+#!/bin/bash
+#
+# Collection of helper functions for the dotfiles CLI (modeled on clonerepo's bash_helpers).
+# Keep bash 3.2 compatible: bin/dotfiles runs on stock macOS before Homebrew exists.
+
+log() {
+  echo "==> $*"
+}
+
+success() {
+  echo -e "\033[1;32mSUCCESS: $*\033[1;00m"
+}
+
+warn() {
+  echo -e "\033[1;33mWARN: $*\033[1;00m" >&2
+}
+
+fail() {
+  echo -e "\033[1;31mFAIL: $*\033[1;00m" >&2
+}
+
+# Detect if something is installed and fail if not found
+check_installed() {
+  if ! command -v "$1" &> /dev/null; then
+    fail "${1} is not installed."
+    exit 1
+  fi
+}

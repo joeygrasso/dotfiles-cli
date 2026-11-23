@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+#
+# Dotfiles helper: set up a machine from a dotfiles repo and keep it linked.
+# The tool is generic; what gets linked lives in the dotfiles repo's `manifest`.
+# Bash 3.2 compatible so it works on stock macOS before Homebrew exists.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# Resolve the CLI's real location (follows symlinks) without changing the caller's
+# working directory.
+dir_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+source "${dir_root}/lib/bash_helpers"
+
+DEFAULT_DOTFILES_DIR="${HOME}/repos/dotfiles"
+STATE_DIR="${HOME}/.config/dotfiles"
+WORK_DIR="${STATE_DIR}/work.d"
+
+usage() {
+    cat <<EOF
+USAGE: dotfiles <command> [options]
+Set up a machine from a dotfiles repo and keep it linked.
+
+COMMANDS:
+  init        Clone your dotfiles repo, or start a new one with --new.
+  bootstrap   Full setup driven by what the repo contains: Aptfile,
+              Brewfiles, plugins, links. Detects macOS, WSL and Linux.
+  install     Link the dotfiles into \$HOME. Replaced files are moved to
+              ~/.dotfiles-backup/<timestamp>/, never overwritten.
+  update      Pull the repo, then re-link with the work profiles already
+              installed on this machine.
+  plugins     Clone the repos listed as 'clone' in the manifest.
+  dir         Print the repo path, e.g. cd "\$(dotfiles dir)".
+
+OPTIONS:
+  -h, --help        Show this message, or a command's options with
+                    'dotfiles <command> -h'.
+  -v, --version     Show version and exit.
+
+The repo is found via \$DOTFILES_DIR, \$DOTFILES, the path recorded by the
+last 'dotfiles install', then ~/repos/dotfiles. See the README for the
+manifest format and hooks.
+
+EOF
+}
+
+usage_init() {
+    cat <<EOF
+USAGE: dotfiles init [options] <repo>
+       dotfiles init --new [options]
+Clone your dotfiles repo, or create a starter one, then run
+'dotfiles bootstrap'.
+
+<repo> is a git URL or path, or GitHub shorthand: owner/name clones
+git@github.com:owner/name.git. Defaults to \$DOTFILES_REPO if set.
+
+OPTIONS:
+  -d, --dir         Destination. Default \$DOTFILES_DIR, else
+                    ~/repos/dotfiles.
+      --https       Expand owner/name to https://github.com/owner/name.git
+                    instead of SSH (e.g. a public repo, no SSH key yet).
+      --new         Create a new repo with a starter manifest instead of
+                    cloning.
+  -h, --help        Show this message.
+
+EOF
+}
+
+usage_bootstrap() {
+    cat <<EOF
+USAGE: dotfiles bootstrap [options]
+Set up this machine from the repo. Each step runs only if the repo asks
+for it, and all of them are safe to re-run:
+  Aptfile, Aptfile.wsl          sudo apt-get install (Linux/WSL)
+  Brewfile, Brewfile.macos      install Homebrew if needed, brew bundle
+  clone lines in manifest       dotfiles plugins
+  link/merge lines              dotfiles install
+  mise config linked            mise install
+  .zshrc linked (Linux/WSL)     make zsh the login shell
+
+OPTIONS:
+  -w, --work        Apply work profile work/<name>.* and its Brewfile.
+                    Repeatable.
+  -h, --help        Show this message.
+
+EOF
+}
+
+usage_install() {
+    cat <<EOF
+USAGE: dotfiles install [options]
+Link the dotfiles into \$HOME per the repo's manifest. Replaced files are
+moved to ~/.dotfiles-backup/<timestamp>/.
+
+OPTIONS:
+  -n, --dry-run     Show what would change without touching anything.
+  -w, --work        Also apply work profile work/<name>.*. Repeatable.
+  -h, --help        Show this message.
+
+EOF
+}
+
+usage_update() {
+    cat <<EOF
+USAGE: dotfiles update [options]
+Fast-forward the repo from its remote, then re-link with the work profiles
+found in ~/.config/dotfiles/work.d.
+
+OPTIONS:
+  -n, --dry-run     Pull, but only show what re-linking would change.
+  -h, --help        Show this message.
+
+EOF
+}
+
+usage_plugins() {
+    cat <<EOF
+USAGE: dotfiles plugins
+Shallow-clone every 'clone <url> <dest>' line in the manifest whose
+destination does not exist yet.
+
+EOF
+}
+
+usage_dir() {
+    cat <<EOF
+USAGE: dotfiles dir
+Print the dotfiles repo path.
+
+EOF
+}
+
+# Ensure a flag that takes a value was actually given one.
+# Usage: require_value <flag> <remaining arg count> [next arg]
+require_value() {
+  if [[ $2 -lt 2 || -z "${3:-}" || "${3:-}" == -* ]]; then
+    fail "Option $1 requires a value."
+    exit 1
+  fi
+}
+
+# Reject anything a command doesn't accept, showing that command's usage.
+unsupported() {
+  fail "Unsupported flag detected: $2"
+  "usage_$1" >&2
+  exit 1
+}
+
+### Repo discovery
+
+is_dotfiles_repo() {
+  [[ -n ${1:-} && -f $1/manifest ]]
+}
+
+recorded_repo() {
+  if [[ -r ${STATE_DIR}/repo ]]; then cat "${STATE_DIR}/repo"; fi
+}
+
+# Set DOTFILES to the repo root (exported for hooks), or exit with a hint.
+require_repo() {
+  local candidate
+  for candidate in "${DOTFILES_DIR:-}" "${DOTFILES:-}" "$(recorded_repo)" "${DEFAULT_DOTFILES_DIR}"; do
+    if is_dotfiles_repo "${candidate}"; then
+      DOTFILES="$(cd "${candidate}" && pwd)"
+      export DOTFILES
+      return
+    fi
+  done
+  fail "dotfiles repo not found. Run 'dotfiles init' or set DOTFILES_DIR."
+  exit 1
+}
+
+### Manifest
+#
+#   # comment
+#   link   <repo path>  <path under $HOME>     symlink
+#   merge  <repo path>  <path under $HOME>     deep-merge a JSON fragment (needs jq)
+#   clone  <git url>    <path under $HOME>     shallow clone if missing (dotfiles plugins)
+
+# Paths must stay inside the repo / $HOME: relative, no `..` segments.
+safe_path() {
+  [[ -n $1 && $1 != /* && $1 != "~"* && ! $1 =~ (^|/)\.\.(/|$) ]]
+}
+
+# Print the manifest entries of one kind as "<a> <b>" lines, validating every line.
+manifest_entries() { # <kind>
+  local line kind a b extra lineno=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%#*}"
+    kind="" a="" b="" extra=""
+    read -r kind a b extra <<< "${line}" || true
+    [[ -z ${kind} ]] && continue
+    if [[ -z ${b} || -n ${extra} ]]; then
+      fail "manifest:${lineno}: expected '<kind> <source> <dest>'"
+      exit 1
+    fi
+    case "${kind}" in
+      link|merge|clone) ;;
+      *) fail "manifest:${lineno}: unknown kind '${kind}'"; exit 1;;
+    esac
+    if ! safe_path "${b}" || { [[ ${kind} != clone ]] && ! safe_path "${a}"; }; then
+      fail "manifest:${lineno}: paths must be relative and stay inside the repo or \$HOME"
+      exit 1
+    fi
+    if [[ ${kind} == "$1" ]]; then echo "${a} ${b}"; fi
+  done < "${DOTFILES}/manifest"
+}
+
+### Work profiles
+# Kept as a space-separated string, not an array: empty arrays trip `set -u` on bash 3.2.
+
+WORK_PROFILES=""
+
+add_work_profile() {
+  if [[ ! $1 =~ ^[A-Za-z0-9_-]+$ ]]; then
+    fail "Invalid work profile name: $1"
+    exit 1
+  fi
+  WORK_PROFILES="${WORK_PROFILES:+${WORK_PROFILES} }$1"
+}
+
+check_work_profiles() {
+  local name
+  for name in ${WORK_PROFILES}; do
+    if [[ ! -f ${DOTFILES}/work/${name}.rc ]]; then
+      fail "No such work profile: work/${name}.rc"
+      exit 1
+    fi
+  done
+}
+
+# Profiles applied on this machine, read back from the links `install --work` makes
+installed_work_profiles() {
+  local file
+  for file in "${WORK_DIR}"/*.rc; do
+    if [[ -e $file ]]; then basename "${file}" .rc; fi
+  done
+}
+
+### install
+
+DRY_RUN=0
+BACKUP=""
+
+run() {
+  if (( DRY_RUN )); then echo "[dry-run] $*"; else "$@"; fi
+}
+
+# Run an executable from the repo if present. Hooks come from your own repo, so they are
+# trusted the same way the dotfiles are. Not run on a dry run.
+run_hook() { # <repo path>
+  if [[ -x ${DOTFILES}/$1 ]]; then
+    if (( DRY_RUN )); then
+      echo "[dry-run] run $1"
+    else
+      "${DOTFILES}/$1"
+    fi
+  fi
+}
+
+link() { # <repo path> <target in $HOME>
+  local src="${DOTFILES}/$1" dst="${HOME}/$2"
+  if [[ ! -e $src ]]; then
+    warn "$1 is in the manifest but not in the repo; skipping."
+    return
+  fi
+  if [[ -L $dst && $(readlink "$dst") == "$src" ]]; then
+    echo "ok       $2"
+    return
+  fi
+  run mkdir -p "$(dirname "$dst")"
+  if [[ -e $dst || -L $dst ]]; then
+    run mkdir -p "${BACKUP}/$(dirname "$2")"
+    run mv "$dst" "${BACKUP}/$2"
+    echo "backup   $2 -> ${BACKUP}/$2"
+  fi
+  run ln -s "$src" "$dst"
+  echo "link     $2"
+}
+
+# Merge a JSON fragment into an existing file instead of replacing it (keeps local-only settings)
+merge_json() { # <repo fragment> <target in $HOME>
+  local src="${DOTFILES}/$1" dst="${HOME}/$2"
+  if [[ ! -e $dst ]]; then
+    run mkdir -p "$(dirname "$dst")"
+    run cp "$src" "$dst"
+    echo "create   $2"
+    return
+  fi
+  if ! command -v jq >/dev/null; then
+    echo "skip     $2 (jq not installed; merge $1 by hand)"
+    return
+  fi
+  if ! jq -e . "$dst" >/dev/null 2>&1; then
+    echo "skip     $2 (not valid JSON; merge $1 by hand)"
+    return
+  fi
+  if jq -e -s '.[0] * .[1] == .[0]' "$dst" "$src" >/dev/null; then
+    echo "ok       $2 (already merged)"
+    return
+  fi
+  run mkdir -p "${BACKUP}/$(dirname "$2")"
+  run cp "$dst" "${BACKUP}/$2"
+  echo "backup   $2 -> ${BACKUP}/$2"
+  if (( DRY_RUN )); then
+    echo "[dry-run] merge $1 into $2"
+  else
+    jq -s '.[0] * .[1]' "$dst" "$src" > "$dst.tmp" && mv "$dst.tmp" "$dst"
+  fi
+  echo "merge    $2"
+}
+
+# Links everything. Expects DOTFILES, DRY_RUN and WORK_PROFILES to be set.
+link_all() {
+  check_work_profiles
+  BACKUP="${HOME}/.dotfiles-backup/$(date +%Y%m%d-%H%M%S)"
+
+  # Read the whole manifest first so a bad line fails before anything changes
+  local links merges src dst
+  links="$(manifest_entries link)"
+  merges="$(manifest_entries merge)"
+
+  run_hook hooks/pre-install
+
+  while read -r src dst; do
+    if [[ -n ${src} ]]; then link "${src}" "${dst}"; fi
+  done <<< "${links}"
+  while read -r src dst; do
+    if [[ -n ${src} ]]; then merge_json "${src}" "${dst}"; fi
+  done <<< "${merges}"
+
+  local name
+  for name in ${WORK_PROFILES}; do
+    link "work/${name}.rc" ".config/dotfiles/work.d/${name}.rc"
+    if [[ -f ${DOTFILES}/work/${name}.ssh ]]; then
+      link "work/${name}.ssh" ".ssh/config.d/${name}"
+    fi
+    run_hook "work/${name}.install"
+  done
+
+  run_hook hooks/post-install
+
+  if (( ! DRY_RUN )); then
+    if [[ -d ${HOME}/.ssh ]]; then chmod 700 "${HOME}/.ssh"; fi
+    mkdir -p "${STATE_DIR}"
+    echo "${DOTFILES}" > "${STATE_DIR}/repo"
+  fi
+}
+
+cmd_install() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_install; exit 0;;
+      -n|--dry-run) DRY_RUN=1;;
+      -w|--work)
+        require_value "$1" $# "${2:-}"
+        add_work_profile "$2"; shift;;
+      *) unsupported install "$1";;
+    esac
+    shift
+  done
+
+  require_repo
+  link_all
+}
+
+### update
+
+cmd_update() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_update; exit 0;;
+      -n|--dry-run) DRY_RUN=1;;
+      *) unsupported update "$1";;
+    esac
+    shift
+  done
+
+  check_installed git
+  require_repo
+
+  log "Pulling ${DOTFILES}..."
+  if ! git -C "${DOTFILES}" pull --ff-only; then
+    fail "could not fast-forward ${DOTFILES}; resolve it by hand and rerun."
+    exit 1
+  fi
+
+  local name
+  for name in $(installed_work_profiles); do
+    if [[ -f ${DOTFILES}/work/${name}.rc ]]; then
+      add_work_profile "${name}"
+    else
+      warn "work profile ${name} is installed but work/${name}.rc no longer exists; skipping."
+    fi
+  done
+  log "Linking${WORK_PROFILES:+ (work: ${WORK_PROFILES})}..."
+  link_all
+  success "dotfiles updated."
+}
+
+### plugins
+
+install_plugins() {
+  local entries url dst
+  entries="$(manifest_entries clone)"
+  if [[ -z ${entries} ]]; then return 0; fi
+  check_installed git
+  while read -r url dst; do
+    if [[ -d ${HOME}/${dst} ]]; then
+      echo "ok       ${dst}"
+    else
+      log "cloning: ${url}"
+      git clone --depth=1 "${url}" "${HOME}/${dst}"
+    fi
+  done <<< "${entries}"
+}
+
+cmd_plugins() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_plugins; exit 0;;
+      *) unsupported plugins "$1";;
+    esac
+    shift
+  done
+
+  require_repo
+  install_plugins
+}
+
+### bootstrap
+
+# Print the brew binary: on PATH, else Apple Silicon, Intel, or Linuxbrew.
+find_brew() {
+  local brew
+  for brew in "$(command -v brew || true)" /opt/homebrew/bin/brew /usr/local/bin/brew \
+              /home/linuxbrew/.linuxbrew/bin/brew; do
+    if [[ -n $brew && -x $brew ]]; then
+      echo "$brew"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Package names from the given Aptfiles (one or more per line, # comments), space separated.
+apt_packages() { # <repo path>...
+  local file line out=""
+  for file in "$@"; do
+    [[ -f ${DOTFILES}/${file} ]] || continue
+    while IFS= read -r line || [[ -n $line ]]; do
+      out="${out} ${line%%#*}"
+    done < "${DOTFILES}/${file}"
+  done
+  out="$(printf '%s' "${out}" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+  # Checked before the caller word-splits it, so no globs or shell syntax get through
+  if [[ -n $out && ! $out =~ ^[A-Za-z0-9.+:\ -]+$ ]]; then
+    fail "Aptfile: only package names are allowed."
+    exit 1
+  fi
+  echo "${out}"
+}
+
+# True if the manifest links (or merges) anything to a destination matching one of the patterns.
+links_target() { # <glob>...
+  local src dst pattern
+  while read -r src dst; do
+    [[ -n ${dst} ]] || continue
+    for pattern in "$@"; do
+      # shellcheck disable=SC2053 # glob match is intended
+      if [[ ${dst} == ${pattern} ]]; then return 0; fi
+    done
+  done <<< "$(manifest_entries link; manifest_entries merge)"
+  return 1
+}
+
+cmd_bootstrap() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_bootstrap; exit 0;;
+      -w|--work)
+        require_value "$1" $# "${2:-}"
+        add_work_profile "$2"; shift;;
+      *) unsupported bootstrap "$1";;
+    esac
+    shift
+  done
+
+  require_repo
+  check_work_profiles
+
+  local os
+  case "$(uname -s)" in
+    Darwin) os=macos;;
+    Linux)  if grep -qi microsoft /proc/version 2>/dev/null; then os=wsl; else os=linux; fi;;
+    *) fail "Unsupported OS: $(uname -s)"; exit 1;;
+  esac
+  log "Bootstrapping ${os}${WORK_PROFILES:+ (work: ${WORK_PROFILES})}..."
+
+  # OS packages, from Aptfile (+ Aptfile.wsl on WSL)
+  if [[ $os != macos ]]; then
+    local apt_files="Aptfile" packages
+    if [[ $os == wsl ]]; then apt_files="Aptfile Aptfile.wsl"; fi
+    # shellcheck disable=SC2086 # intentional word splitting of the file list
+    packages="$(apt_packages ${apt_files})"
+    if [[ -n ${packages} ]]; then
+      if command -v apt-get >/dev/null; then
+        log "Installing apt packages..."
+        sudo apt-get update
+        # shellcheck disable=SC2086 # one package per word
+        sudo apt-get install -y ${packages}
+      else
+        warn "apt-get not found; install these yourself: ${packages}"
+      fi
+    fi
+  fi
+
+  # Homebrew, only if the repo has Brewfiles to apply
+  local brewfiles="Brewfile" name file
+  if [[ $os == macos ]]; then brewfiles="${brewfiles} Brewfile.macos"; fi
+  for name in ${WORK_PROFILES}; do brewfiles="${brewfiles} work/Brewfile.${name}"; done
+  local wanted=""
+  for file in ${brewfiles}; do
+    if [[ -f ${DOTFILES}/${file} ]]; then wanted="${wanted:+${wanted} }${file}"; fi
+  done
+  if [[ -n ${wanted} ]]; then
+    if ! command -v brew >/dev/null && ! find_brew >/dev/null; then
+      log "Installing Homebrew..."
+      NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+    eval "$("$(find_brew)" shellenv)"
+    for file in ${wanted}; do
+      brew bundle --file="${DOTFILES}/${file}"
+    done
+  fi
+
+  install_plugins
+  link_all
+
+  if command -v mise >/dev/null && links_target '.config/mise/*' '.mise.toml' '.tool-versions'; then
+    mise install
+  fi
+
+  # Make zsh the login shell so Windows Terminal and `wsl` start it directly
+  if [[ $os != macos ]] && links_target .zshrc && command -v zsh >/dev/null \
+      && [[ $(basename "${SHELL:-}") != zsh ]]; then
+    chsh -s "$(command -v zsh)"
+  fi
+
+  success "Bootstrap complete. Open a new shell to load the config."
+}
+
+### init
+
+# owner/name -> GitHub URL; anything else (URL, scp-style, local path) is used as given.
+expand_repo() { # <repo> <https: 0|1>
+  if [[ $1 =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && ! -e $1 ]]; then
+    if (( $2 )); then
+      echo "https://github.com/$1.git"
+    else
+      echo "git@github.com:$1.git"
+    fi
+  else
+    echo "$1"
+  fi
+}
+
+# Hooks are code from the repo that runs as you; say so before the first install.
+warn_hooks() { # <repo dir>
+  local hooks="" file
+  for file in "$1"/hooks/* "$1"/work/*.install; do
+    if [[ -f $file && -x $file ]]; then hooks="${hooks}    ${file#"$1"/}"$'\n'; fi
+  done
+  if [[ -n $hooks ]]; then
+    warn "This repo has hooks that run as you during install/bootstrap:"
+    printf '%s' "${hooks}" >&2
+    echo "Review them first if you don't own this repo; 'dotfiles install -n' lists what would run." >&2
+  fi
+}
+
+STARTER_MANIFEST='# What `dotfiles install` does with this repo. One entry per line:
+#
+#   link   <repo path>  <path under $HOME>   symlink; existing files go to ~/.dotfiles-backup/
+#   merge  <repo path>  <path under $HOME>   deep-merge a JSON fragment (needs jq)
+#   clone  <git url>    <path under $HOME>   shallow clone if missing (`dotfiles plugins`)
+#
+# Paths are relative: sources to this repo, destinations to $HOME. For example:
+#
+# link   zsh/zshrc             .zshrc
+# link   git/gitconfig         .gitconfig
+# merge  vscode/settings.json  .config/Code/User/settings.json
+# clone  https://github.com/ohmyzsh/ohmyzsh.git  .oh-my-zsh
+#
+# Optional files `dotfiles bootstrap` also uses:
+#   Aptfile, Aptfile.wsl         apt packages, one or more per line (Linux/WSL)
+#   Brewfile, Brewfile.macos     brew bundle (installs Homebrew if needed)
+#   hooks/pre-install, hooks/post-install   executables run around linking
+#   work/<name>.rc|.ssh|.install|Brewfile.<name>   applied with --work <name>
+'
+
+new_repo() { # <dest>
+  if [[ -e $1 ]] && [[ -n "$(ls -A "$1" 2>/dev/null)" ]]; then
+    fail "$1 already exists and is not empty."
+    exit 1
+  fi
+  mkdir -p "$1/hooks"
+  printf '%s' "${STARTER_MANIFEST}" > "$1/manifest"
+  cat > "$1/hooks/pre-install.example" <<'EOF'
+#!/usr/bin/env bash
+# Rename to pre-install and `chmod +x` it to run before linking. $DOTFILES is the repo path.
+set -euo pipefail
+EOF
+  git init -q "$1"
+  success "Created a new dotfiles repo in $1"
+}
+
+cmd_init() {
+  local repo="${DOTFILES_REPO:-}" dest="${DOTFILES_DIR:-${DEFAULT_DOTFILES_DIR}}"
+  local https=0 new=0 positional=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_init; exit 0;;
+      -d|--dir)
+        require_value "$1" $# "${2:-}"
+        dest="$2"; shift;;
+      --https) https=1;;
+      --new) new=1;;
+      -*) unsupported init "$1";;
+      *)
+        if [[ -n $positional ]]; then
+          fail "Only one repo can be given."
+          exit 1
+        fi
+        positional="$1"; repo="$1";;
+    esac
+    shift
+  done
+
+  check_installed git
+
+  if (( new )); then
+    if [[ -n $positional ]]; then
+      fail "--new creates a repo; it doesn't take one. Use -d to choose where."
+      exit 1
+    fi
+    new_repo "${dest}"
+  elif is_dotfiles_repo "${dest}"; then
+    log "${dest} is already a dotfiles checkout."
+  else
+    if [[ -z $repo ]]; then
+      fail "Which repo? e.g. 'dotfiles init owner/dotfiles', or 'dotfiles init --new' to start one."
+      usage_init >&2
+      exit 1
+    fi
+    local url
+    url="$(expand_repo "${repo}" "${https}")"
+    log "cloning: ${url}"
+    if ! git clone "${url}" "${dest}"; then
+      fail "could not clone ${url}"
+      exit 1
+    fi
+    if ! is_dotfiles_repo "${dest}"; then
+      warn "${dest} has no manifest file; see 'dotfiles init --new' for the format."
+    fi
+    success "Cloned dotfiles to ${dest}"
+    warn_hooks "${dest}"
+  fi
+
+  local prefix=""
+  if [[ $(cd "${dest}" && pwd) != "$(cd "${DEFAULT_DOTFILES_DIR}" 2>/dev/null && pwd || true)" ]]; then
+    prefix="DOTFILES_DIR=${dest} "
+  fi
+  if (( new )); then
+    echo "Next: add files and manifest entries, then: ${prefix}dotfiles install -n"
+  else
+    echo "Next: ${prefix}dotfiles bootstrap [--work NAME]"
+  fi
+}
+
+### Main Execution:
+
+# Bare invocation: show usage instead of doing anything.
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+COMMAND="$1"; shift
+
+case "${COMMAND}" in
+  -h|--help|help)
+    usage
+    exit 0;;
+  -v|--version|version)
+    echo "v${VERSION}"
+    exit 0;;
+  init)      cmd_init "$@";;
+  bootstrap) cmd_bootstrap "$@";;
+  install)   cmd_install "$@";;
+  update)    cmd_update "$@";;
+  plugins)   cmd_plugins "$@";;
+  dir)
+    if [[ $# -gt 0 ]]; then
+      case "$1" in -h|--help) usage_dir; exit 0;; *) unsupported dir "$1";; esac
+    fi
+    require_repo
+    echo "${DOTFILES}";;
+  *)
+    fail "Unknown command: ${COMMAND}"
+    usage >&2
+    exit 1;;
+esac
