@@ -123,15 +123,29 @@ for tool in brew sudo apt-get chsh mise zsh; do
   printf '#!/bin/sh\necho "%s $*" >> "%s"\n' "$tool" "$CALLS" > "$FAKE/$tool"
   chmod +x "$FAKE/$tool"
 done
-bootstrap() { : > "$CALLS"; PATH="$FAKE:$PATH" SHELL=/bin/bash "$CLI" bootstrap "$@"; }
+# Fake sudo runs its command (so `sudo tee` writes the fake shells file); fake chsh fails for
+# shells not listed there, like the real one.
+SHELLS="$TMP/shells"
+printf '#!/bin/sh\necho "sudo $*" >> "%s"\n[ "$1" = tee ] && exec "$@"\nexit 0\n' "$CALLS" > "$FAKE/sudo"
+printf '#!/bin/sh\necho "chsh $*" >> "%s"\ngrep -qxF "$2" "%s"\n' "$CALLS" "$SHELLS" > "$FAKE/chsh"
+echo /bin/bash > "$SHELLS"
+bootstrap() {
+  : > "$CALLS"
+  PATH="$FAKE:$PATH" SHELL=/bin/bash DOTFILES_SHELLS_FILE="$SHELLS" "$CLI" bootstrap "$@"
+}
 called() { grep -q "^$1" "$CALLS"; }
 
 check "bare bootstrap" bootstrap
 check "  no brew without a Brewfile" fails called brew
-check "  no apt without an Aptfile" fails called sudo
+check "  no apt without an Aptfile" fails called "sudo apt-get"
 check "  no mise without a mise config" fails called mise
 if [[ $(uname -s) == Linux ]]; then
-  check "  chsh because .zshrc is linked" called "chsh -s"
+  check "  chsh because .zshrc is linked" called "chsh -s $FAKE/zsh"
+  check "  zsh registered in /etc/shells first" grep -qxF "$FAKE/zsh" "$SHELLS"
+  check "  re-run doesn't register zsh twice" bootstrap
+  check "  ...only one entry" test "$(grep -cxF "$FAKE/zsh" "$SHELLS")" = 1
+  printf '#!/bin/sh\nexit 1\n' > "$FAKE/chsh"
+  check "  chsh failure only warns" bootstrap
 fi
 
 echo 'brew "jq"' > "$TMP/clone/Brewfile"

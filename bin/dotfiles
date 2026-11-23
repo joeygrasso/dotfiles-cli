@@ -5,7 +5,7 @@
 # Bash 3.2 compatible so it works on stock macOS before Homebrew exists.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # Resolve the CLI's real location (follows symlinks) without changing the caller's
 # working directory.
@@ -462,6 +462,24 @@ apt_packages() { # <repo path>...
   echo "${out}"
 }
 
+# chsh only accepts shells listed in /etc/shells, which Homebrew's zsh is not by default.
+# Register it first (as Homebrew's docs suggest). A failure here warns instead of failing
+# bootstrap, since everything else is already done.
+set_login_shell() { # <shell path>
+  local shells="${DOTFILES_SHELLS_FILE:-/etc/shells}"
+  if ! grep -qxF "$1" "${shells}" 2>/dev/null; then
+    log "Adding $1 to ${shells}..."
+    if ! echo "$1" | sudo tee -a "${shells}" >/dev/null; then
+      warn "could not add $1 to ${shells}; set the shell yourself: chsh -s $1"
+      return 0
+    fi
+  fi
+  log "Changing login shell to $1..."
+  if ! chsh -s "$1"; then
+    warn "chsh failed; set the shell yourself: chsh -s $1"
+  fi
+}
+
 # True if the manifest links (or merges) anything to a destination matching one of the patterns.
 links_target() { # <glob>...
   local src dst pattern
@@ -545,7 +563,7 @@ cmd_bootstrap() {
   # Make zsh the login shell so Windows Terminal and `wsl` start it directly
   if [[ $os != macos ]] && links_target .zshrc && command -v zsh >/dev/null \
       && [[ $(basename "${SHELL:-}") != zsh ]]; then
-    chsh -s "$(command -v zsh)"
+    set_login_shell "$(command -v zsh)"
   fi
 
   success "Bootstrap complete. Open a new shell to load the config."
