@@ -36,7 +36,9 @@ echo "# zshrc" > "$REPO/zsh/zshrc"
 echo '{"a":1}' > "$REPO/claude/settings.json"
 echo "# acme" > "$REPO/work/acme.rc"
 echo "Host acme" > "$REPO/work/acme.ssh"
+# shellcheck disable=SC2016 # $HOME expands when the hook runs, not here
 printf '#!/bin/sh\ntouch "$HOME/pre-install-ran"\n' > "$REPO/hooks/pre-install"
+# shellcheck disable=SC2016
 printf '#!/bin/sh\ntouch "$HOME/acme-install-ran"\n' > "$REPO/work/acme.install"
 chmod +x "$REPO/hooks/pre-install" "$REPO/work/acme.install"
 cat > "$REPO/manifest" <<'EOF'

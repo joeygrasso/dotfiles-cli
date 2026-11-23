@@ -418,13 +418,12 @@ install_plugins() {
 }
 
 cmd_plugins() {
-  while [ $# -gt 0 ]; do
+  if [ $# -gt 0 ]; then
     case "$1" in
       -h|--help) usage_plugins; exit 0;;
       *) unsupported plugins "$1";;
     esac
-    shift
-  done
+  fi
 
   require_repo
   install_plugins
@@ -580,6 +579,7 @@ warn_hooks() { # <repo dir>
   fi
 }
 
+# shellcheck disable=SC2016 # literal text written to the new manifest
 STARTER_MANIFEST='# What `dotfiles install` does with this repo. One entry per line:
 #
 #   link   <repo path>  <path under $HOME>   symlink; existing files go to ~/.dotfiles-backup/
